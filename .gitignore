@@ -1,0 +1,23 @@
+*.pyc
+*.pth
+*.pt
+*.pkl
+demo*
+
+log/*
+.vscode/
+
+*.pdb
+*.zip
+*.ipynb
+figures/
+
+*PDB_AF2*
+*POCKETS*
+*Preprocessed*
+
+# 排除 DataSets 目录及其所有内容
+DataSets/
+
+# 排除 final 目录及其所有内容
+final/
