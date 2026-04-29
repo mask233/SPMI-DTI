@@ -7,7 +7,7 @@ fi
 
 # 获取当前时间，格式为YYYY-MM-DD_HH-MM-SS
 current_time=$(date +"%Y-%m-%d_%H-%M-%S")
-comment="MIF-DTI"
+comment="SPIM-DTI"
 file_name="log/$current_time-$comment.log"
 
 # 运行nohup命令，输出日志到log目录下，文件名为当前时间

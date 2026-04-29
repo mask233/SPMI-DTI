@@ -34,7 +34,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from config import hyperparameter
-from model import MIFDTI
+from model import SPIMDTI
 from utils.DataPrepare import get_kfold_data, shuffle_dataset
 from utils.DataSetsFunction import CustomDataSet, collate_fn
 from utils.EarlyStoping import EarlyStopping
@@ -60,7 +60,7 @@ torch._inductor.config.triton.cudagraphs = False
 
 def run_MIF_model(SEED, DATASET, MODEL, K_Fold, LOSS, device):
     """
-    运行MIF-DTI模型的K折交叉验证训练和测试流程
+    运行SPIM-DTI模型的K折交叉验证训练和测试流程
     
     Args:
         SEED: 随机种子
@@ -372,7 +372,7 @@ def run_MIF_model(SEED, DATASET, MODEL, K_Fold, LOSS, device):
 
 def ensemble_run_MIF_model(SEED, DATASET, K_Fold, device):
     """
-    运行集成MIF-DTI模型测试流程
+    运行集成SPIM-DTI模型测试流程
     加载K折训练好的模型，在测试集上进行集成预测
     
     Args:
@@ -486,7 +486,7 @@ def ensemble_run_MIF_model(SEED, DATASET, K_Fold, device):
     # 加载K折训练好的模型
     model = []
     for i in range(K_Fold):
-        model.append(MIFDTI(use_3d=hp.use_3d, use_subpocket=hp.use_subpocket, pocket_num=hp.pocket_num).to(device))
+        model.append(SPIMDTI(use_3d=hp.use_3d, use_subpocket=hp.use_subpocket, pocket_num=hp.pocket_num).to(device))
         # 加载对应折的模型权重（需要先运行K折训练）
         try:
             model[i].load_state_dict(torch.load(
@@ -495,7 +495,7 @@ def ensemble_run_MIF_model(SEED, DATASET, K_Fold, device):
             print('-'* 25 + 'ERROR' + '-'*25)
             error_msg = 'Load pretrained model error: \n' + \
                         str(e) + \
-                        '\n' + 'MIFDTI K-Fold train process is necessary'
+                        '\n' + 'SPIMDTI K-Fold train process is necessary'
             print(error_msg)
             print('-'* 55)
             exit(1)

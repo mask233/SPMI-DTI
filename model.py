@@ -1,6 +1,6 @@
 # -*- coding:utf-8 -*-
 """
-MIF-DTI模型定义文件
+SPIM-DTI模型定义文件
 实现多模态信息融合的药物-靶点相互作用预测模型
 """
 
@@ -236,20 +236,20 @@ class MIFBlock_1D(nn.Module):
         return drugConv, proteinConv, drugPool, proteinPool
 
 
-class MIFDTI(nn.Module):
+class SPIMDTI(nn.Module):
     """
-    MIF-DTI主模型：多模态信息融合的药物-靶点相互作用预测模型
+    SPIM-DTI主模型：多模态信息融合的药物-靶点相互作用预测模型
     融合图结构信息（分子图和蛋白质图）和序列信息（SMILES和氨基酸序列）
     """
     def __init__(self, depth=3, device='cuda:1', use_subpocket=False, pocket_num=30):
         """
-        初始化MIF-DTI模型
+        初始化SPIM-DTI模型
         
         Args:
-            depth: 模型深度（MIF块的层数）
+            depth: 模型深度（SPIM块的层数）
             device: 计算设备
         """
-        super(MIFDTI, self).__init__()
+        super(SPIMDTI, self).__init__()
 
         # 输入特征维度设置
         self.drug_in_channels = 43  # 药物原子特征维度
