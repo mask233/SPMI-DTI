@@ -1,0 +1,8 @@
+*.pyc
+*.pyo
+__pycache__/
+*.pdb
+*.txt
+*.csv
+*.md
+*.json
