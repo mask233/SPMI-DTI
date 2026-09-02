@@ -51,6 +51,7 @@ from utils.TestModel import prediction_metrics, save_prediction_records, test_mo
 from utils.ShowResult import show_result
 from utils.split_manifest import file_sha256, save_split_manifest
 from utils import protein_init, ligand_init, ProteinMoleculeDataset
+from utils.dataset import load_prepared_subpocket_cache
 # from utils.dataset import reset_placeholder_stats, get_placeholder_stats, print_placeholder_stats_summary
 from utils.protein_3d_featurizer import protein_3d_init
 import torch_geometric.loader as pyg_loader
@@ -100,6 +101,21 @@ def set_experiment_seed(seed):
     # across different PyTorch/CUDA/GPU stacks.
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
+
+
+def _mean_detached_losses(losses):
+    """Match the historical NumPy float64 mean with one device transfer."""
+    if not losses:
+        return float("nan")
+    values = torch.stack(losses).detach().cpu().numpy().astype(np.float64, copy=False)
+    return float(np.average(values))
+
+
+def _assert_finite_scalar(value, message):
+    """Fail on NaN/Inf with one scalar check instead of repeated diagnostics."""
+    condition = torch.isfinite(value).all()
+    if not condition.item():
+        raise FloatingPointError(message)
 
 
 def _capture_rng_state():
@@ -204,7 +220,8 @@ print(f"[LOG] PyTorch: {torch.__version__}, CUDA: {torch.version.cuda}, PyG: {to
 
 def run_MIF_model(SEED, DATASET, MODEL, K_Fold, LOSS, device,
                   DATA_DIR=None, PREPROCESS_DIR=None, RESUME=False,
-                  NOTIFIER=None):
+                  NOTIFIER=None, DEBUG_DATA_VALIDATION=False,
+                  RUNTIME_OPTIMIZATION=True):
     """
     运行MIF-DTI模型的K折交叉验证训练和测试流程
     
@@ -219,6 +236,8 @@ def run_MIF_model(SEED, DATASET, MODEL, K_Fold, LOSS, device,
         PREPROCESS_DIR: 蛋白、配体和子口袋缓存目录
         RESUME: 若存在逐 epoch 状态，则从下一个 epoch 继续
         NOTIFIER: 可选的非致命通知对象
+        DEBUG_DATA_VALIDATION: 启用逐张量同步数值检查（仅用于诊断）
+        RUNTIME_OPTIMIZATION: 使用严格等价优化后的运行热路径
     """
     # 设置随机种子以确保可复现性
     set_experiment_seed(SEED)
@@ -237,6 +256,13 @@ def run_MIF_model(SEED, DATASET, MODEL, K_Fold, LOSS, device,
         if os.path.exists(default_cache_path):
             print(f"检测到子口袋预处理文件，自动使用: {default_cache_path}")
             hp.subpocket_cache_path = default_cache_path
+
+    shared_subpocket_cache = None
+    if (hp.use_subpocket and hp.subpocket_cache_path is not None
+            and os.path.isfile(hp.subpocket_cache_path)):
+        shared_subpocket_cache = load_prepared_subpocket_cache(
+            hp.subpocket_cache_path, max_subpockets=hp.pocket_num
+        )
 
     # 从文本文件加载数据集
     print("Train in " + DATASET)
@@ -354,19 +380,22 @@ def run_MIF_model(SEED, DATASET, MODEL, K_Fold, LOSS, device,
             train_dataset, ligand_dict, protein_dict, device=device,
             use_3d=hp.use_3d, pdb_dir=hp.pdb_dir, prot_3d_obj=prot_3d_dict,
             use_subpocket=hp.use_subpocket, subpocket_dir=hp.subpocket_dir, pocket_num=hp.pocket_num,
-            subpocket_cache_path=hp.subpocket_cache_path
+            subpocket_cache_path=hp.subpocket_cache_path,
+            subpocket_obj=shared_subpocket_cache,
         )
         valid_dataset = ProteinMoleculeDataset(
             valid_dataset, ligand_dict, protein_dict, device=device,
             use_3d=hp.use_3d, pdb_dir=hp.pdb_dir, prot_3d_obj=prot_3d_dict,
             use_subpocket=hp.use_subpocket, subpocket_dir=hp.subpocket_dir, pocket_num=hp.pocket_num,
-            subpocket_cache_path=hp.subpocket_cache_path
+            subpocket_cache_path=hp.subpocket_cache_path,
+            subpocket_obj=shared_subpocket_cache,
         )
         test_dataset = ProteinMoleculeDataset(
             test_data_list, ligand_dict, protein_dict, device=device,
             use_3d=hp.use_3d, pdb_dir=hp.pdb_dir, prot_3d_obj=prot_3d_dict,
             use_subpocket=hp.use_subpocket, subpocket_dir=hp.subpocket_dir, pocket_num=hp.pocket_num,
-            subpocket_cache_path=hp.subpocket_cache_path
+            subpocket_cache_path=hp.subpocket_cache_path,
+            subpocket_obj=shared_subpocket_cache,
         )
         # # 输出占位符统计汇总
         # print_placeholder_stats_summary()
@@ -379,7 +408,13 @@ def run_MIF_model(SEED, DATASET, MODEL, K_Fold, LOSS, device,
         test_loader = pyg_loader.DataLoader(test_dataset, batch_size=hp.Batch_size, shuffle=False, follow_batch=['mol_x', 'clique_x', 'prot_node_aa'], drop_last=False, **loader_stability)
                                     
         # 创建模型
-        model = MODEL(device=device, use_subpocket=hp.use_subpocket, pocket_num=hp.pocket_num)
+        model = MODEL(
+            device=device,
+            use_subpocket=hp.use_subpocket,
+            pocket_num=hp.pocket_num,
+            debug_data_validation=DEBUG_DATA_VALIDATION,
+            runtime_optimization=RUNTIME_OPTIMIZATION,
+        )
 
         # 初始化模型权重
         weight_p, bias_p = [], []
@@ -434,6 +469,7 @@ def run_MIF_model(SEED, DATASET, MODEL, K_Fold, LOSS, device,
             # execution policy.  A diagnostic stability run must start from
             # its own state file (or resume another stability run).
             "cuda_stability": bool(CUDA_DEBUG and STRICT_DETERMINISM),
+            "runtime_optimization": bool(RUNTIME_OPTIMIZATION),
         }
         start_epoch = 1
         if RESUME and os.path.isfile(resume_path):
@@ -481,19 +517,17 @@ def run_MIF_model(SEED, DATASET, MODEL, K_Fold, LOSS, device,
                 if CUDA_DEBUG and torch.cuda.is_available():
                     torch.cuda.synchronize(device)
                 
-                # NaN 检测
-                if torch.isnan(predicted_y).any() or torch.isinf(predicted_y).any():
-                    print(f"[NaN/Inf WARNING] Epoch {epoch}, batch {batch_idx}: NaN={torch.isnan(predicted_y).any().item()}, Inf={torch.isinf(predicted_y).any().item()}")
-                    del predicted_y, data
-                    continue
+                if DEBUG_DATA_VALIDATION and not torch.isfinite(predicted_y).all().item():
+                    raise FloatingPointError(
+                        f"Non-finite logits at epoch {epoch}, batch {batch_idx}."
+                    )
                 # 计算损失
                 train_loss = Loss(predicted_y, data.cls_y)
-                # 检查 loss 是否异常
-                if torch.isnan(train_loss) or torch.isinf(train_loss):
-                    print(f"[LOSS NaN/Inf] Epoch {epoch}, batch {batch_idx}: loss={train_loss.item()}, skipping")
-                    del predicted_y, data, train_loss
-                    continue
-                train_losses_in_epoch.append(train_loss.item())
+                _assert_finite_scalar(
+                    train_loss,
+                    f"Non-finite loss at epoch {epoch}, batch {batch_idx}.",
+                )
+                train_losses_in_epoch.append(train_loss.detach())
                 
                 # 反向传播
                 train_loss.backward()
@@ -515,7 +549,7 @@ def run_MIF_model(SEED, DATASET, MODEL, K_Fold, LOSS, device,
             if CUDA_DEBUG:
                 torch.cuda.empty_cache()
             # 计算一个epoch的平均训练损失
-            train_loss_a_epoch = np.average(train_losses_in_epoch)
+            train_loss_a_epoch = _mean_detached_losses(train_losses_in_epoch)
 
             # 验证阶段
             valid_losses_in_epoch = []
@@ -533,13 +567,14 @@ def run_MIF_model(SEED, DATASET, MODEL, K_Fold, LOSS, device,
                     valid_labels = data.cls_y
                     # 计算验证损失
                     valid_loss = Loss(valid_scores, valid_labels)
-                    # NaN/Inf 检测
-                    if torch.isnan(valid_loss) or torch.isinf(valid_loss):
-                        print(f"[VALID LOSS NaN/Inf] Epoch {epoch}, batch {batch_idx}: loss={valid_loss.item()}")
-                    valid_losses_in_epoch.append(valid_loss.item())
+                    valid_losses_in_epoch.append(valid_loss.detach())
                     # 转换为numpy数组用于计算指标
                     valid_labels_np = valid_labels.to('cpu').data.numpy()
                     valid_scores_np = F.softmax(valid_scores, 1).to('cpu').data.numpy()
+                    if not np.isfinite(valid_scores_np).all():
+                        raise FloatingPointError(
+                            f"Non-finite validation scores at epoch {epoch}, batch {batch_idx}."
+                        )
                     valid_predictions = np.argmax(valid_scores_np, axis=1)
                     valid_scores_np = valid_scores_np[:, 1]  # 正类概率
 
@@ -561,7 +596,7 @@ def run_MIF_model(SEED, DATASET, MODEL, K_Fold, LOSS, device,
             AUC_dev = roc_auc_score(Y, S)
             tpr, fpr, _ = precision_recall_curve(Y, S)
             PRC_dev = auc(fpr, tpr)
-            valid_loss_a_epoch = np.average(valid_losses_in_epoch)
+            valid_loss_a_epoch = _mean_detached_losses(valid_losses_in_epoch)
 
             # # 获取当前epoch的统计信息
             # stats = get_placeholder_stats()
@@ -659,6 +694,7 @@ def run_MIF_model(SEED, DATASET, MODEL, K_Fold, LOSS, device,
             "seed": SEED,
             "inner_folds": K_Fold,
             "protocol": "fixed outer 20% test; probability mean over inner-fold checkpoints",
+            "runtime_optimization": bool(RUNTIME_OPTIMIZATION),
             "n_outer_test": len(reference_records),
             "metrics": seed_metrics,
         }, handle, ensure_ascii=False, indent=2)

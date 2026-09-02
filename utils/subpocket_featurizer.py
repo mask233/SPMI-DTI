@@ -25,7 +25,11 @@ from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')
 import networkx as nx
 from torch_geometric.data import Data, Batch
-from utils.subpocket_batch import combine_subpocket_graphs, split_subpocket_batch
+from utils.subpocket_batch import (
+    combine_subpocket_graphs,
+    split_subpocket_batch,
+    validate_flat_subpocket_batch,
+)
 import deepchem
 
 # 模块级 logger（可通过环境变量 SUBPOCKET_LOG_FILE 输出到文件）
@@ -114,6 +118,43 @@ def ensure_subpocket_slots(subpocket_data, max_subpockets=30):
         make_virtual_subpocket_graph() for _ in range(max_subpockets - len(normalized_graphs))
     ]
     return combine_subpocket_graphs(graphs)
+
+
+class PreparedSubpocketCache(dict):
+    """Marker mapping whose entries already satisfy the fixed-slot contract."""
+
+    def __init__(self, *args, max_subpockets=30, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.max_subpockets = int(max_subpockets)
+
+
+def prepare_subpocket_cache(cache, max_subpockets=30):
+    """Normalize and strictly validate every protein once on CPU.
+
+    Reusing this mapping across train/validation/test datasets removes repeated
+    cache splitting, padding, validation and disk loading from ``__getitem__``.
+    """
+    if isinstance(cache, PreparedSubpocketCache):
+        if cache.max_subpockets != int(max_subpockets):
+            raise ValueError(
+                f"Prepared cache uses {cache.max_subpockets} slots, "
+                f"requested {max_subpockets}."
+            )
+        return cache
+    if not isinstance(cache, dict):
+        raise TypeError(f"Expected a dict subpocket cache, got {type(cache)!r}.")
+
+    prepared = PreparedSubpocketCache(max_subpockets=max_subpockets)
+    for key, value in cache.items():
+        normalized = ensure_subpocket_slots(value, max_subpockets=max_subpockets)
+        validate_flat_subpocket_batch(
+            normalized,
+            expected_graphs=max_subpockets,
+            feature_width=ATOM_FEATURE_DIM,
+            validate_values=True,
+        )
+        prepared[key] = normalized
+    return prepared
 
 
 def atom_feature(atom):

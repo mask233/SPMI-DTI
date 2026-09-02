@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
 
 from utils.subpocket_batch import (  # noqa: E402
     combine_subpocket_graphs,
+    prepare_flat_subpocket_batch,
     split_subpocket_batch,
 )
 
@@ -73,6 +74,15 @@ def main() -> int:
                 outer_batch = combine_subpocket_graphs(outer_graphs)
                 if outer_batch.ptr.numel() != len(outer_graphs) + 1:
                     raise RuntimeError("Full outer batch rebuilt with an invalid ptr.")
+                optimized_batch = prepare_flat_subpocket_batch(
+                    outer_batch,
+                    expected_graphs=len(outer_graphs),
+                    device="cpu",
+                    validate_values=True,
+                )
+                for field in ("x", "edge_index", "pocket_number", "batch", "ptr"):
+                    if not torch.equal(getattr(outer_batch, field), getattr(optimized_batch, field)):
+                        raise RuntimeError(f"Optimized outer batch changed {field}.")
                 checked_outer_batches += 1
                 outer_graphs = []
             checked += 1
@@ -80,6 +90,15 @@ def main() -> int:
             outer_batch = combine_subpocket_graphs(outer_graphs)
             if outer_batch.ptr.numel() != len(outer_graphs) + 1:
                 raise RuntimeError("Final partial outer batch rebuilt with an invalid ptr.")
+            optimized_batch = prepare_flat_subpocket_batch(
+                outer_batch,
+                expected_graphs=len(outer_graphs),
+                device="cpu",
+                validate_values=True,
+            )
+            for field in ("x", "edge_index", "pocket_number", "batch", "ptr"):
+                if not torch.equal(getattr(outer_batch, field), getattr(optimized_batch, field)):
+                    raise RuntimeError(f"Optimized final batch changed {field}.")
             checked_outer_batches += 1
         print(f"[CACHE CHECK] repetition={repetition} completed", flush=True)
 
@@ -92,7 +111,7 @@ def main() -> int:
         "checked_entry_passes": checked,
         "outer_batch_size": args.outer_batch_size,
         "checked_outer_batches": checked_outer_batches,
-        "runtime_method": "tensor_ptr_without_pyg_separate_or_collate",
+        "runtime_method": "prevalidated_flat_tensor_batch_without_per_sample_split",
     }, ensure_ascii=False, indent=2), flush=True)
     return 0
 

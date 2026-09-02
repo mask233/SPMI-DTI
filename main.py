@@ -51,6 +51,10 @@ parser.add_argument('--resume', action='store_true',
                     help='resume each fold from its latest epoch state when available')
 parser.add_argument('--cuda-stability', action='store_true',
                     help='synchronize CUDA batches and disable flash/memory-efficient SDP for native-crash diagnosis')
+parser.add_argument('--debug-data-validation', action='store_true',
+                    help='enable expensive per-batch tensor validation for diagnostics')
+parser.add_argument('--legacy-runtime', action='store_true',
+                    help='use the pre-optimization subpocket/m2p runtime path for rollback diagnostics')
 parser.add_argument('--ntfy-topic', default=os.environ.get('NTFY_TOPIC'),
                     help='ntfy topic; omitted disables in-process notifications')
 # BUGFIX: 损失函数可显式指定，默认 CE（与实际训练一致，论文公式按 CE 描述）
@@ -94,6 +98,8 @@ def main(notifier=None):
                 MODEL=MIFDTI, K_Fold=args.fold, LOSS=args.loss, device=device,
                 DATA_DIR=hp.data_dir, PREPROCESS_DIR=hp.preprocess_dir,
                 RESUME=args.resume, NOTIFIER=notifier,
+                DEBUG_DATA_VALIDATION=args.debug_data_validation,
+                RUNTIME_OPTIMIZATION=not args.legacy_runtime,
             )
             completed_metrics[seeds[0]] = metrics
         else:
@@ -105,7 +111,9 @@ def main(notifier=None):
                 m = run_MIF_model(SEED=s, DATASET=args.dataSetName,
                                   MODEL=MIFDTI, K_Fold=args.fold, LOSS=args.loss, device=device,
                                   DATA_DIR=hp.data_dir, PREPROCESS_DIR=hp.preprocess_dir,
-                                  RESUME=args.resume, NOTIFIER=notifier)
+                                  RESUME=args.resume, NOTIFIER=notifier,
+                                  DEBUG_DATA_VALIDATION=args.debug_data_validation,
+                                  RUNTIME_OPTIMIZATION=not args.legacy_runtime)
                 completed_metrics[s] = m
                 for k in all_metrics:
                     all_metrics[k].append(m[k])

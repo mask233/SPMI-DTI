@@ -4,11 +4,15 @@ import torch
 from torch_geometric.data import Data
 import pickle
 import torch.utils.data
-import numpy as np
 import os
 from utils.DataSetsFunction import label_sequence, label_smiles
 from utils.protein_3d_featurizer import create_protein_3d_graph
-from utils.subpocket_featurizer import process_protein_subpocket, ensure_subpocket_slots
+from utils.subpocket_featurizer import (
+    PreparedSubpocketCache,
+    ensure_subpocket_slots,
+    prepare_subpocket_cache,
+    process_protein_subpocket,
+)
 
 # # 模块级别的计数器，用于统计占位符创建次数和实际使用的PDB数量（减少警告输出）
 # _placeholder_stats = {
@@ -47,23 +51,29 @@ from utils.subpocket_featurizer import process_protein_subpocket, ensure_subpock
 #         print()
 
 
-def get_m2p_edge(mol_x, prot_x, mol_node_level=None):
-    """ Construct edges from atoms to amino acids """
+def _torch_load_cpu(path):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:  # PyTorch versions before weights_only existed.
+        return torch.load(path, map_location="cpu")
 
-    x1 = np.arange(0, mol_x.shape[0])
-    x1 = x1[mol_node_level==1] if mol_node_level is not None else x1
-    x2 = np.arange(0, prot_x.shape[0])
-    
-    grid_x1, grid_x2 = np.meshgrid(x1, x2)
-    edge_list = torch.LongTensor(np.vstack([grid_x1.ravel(), grid_x2.ravel()]))
-    
-    return edge_list
+
+def load_prepared_subpocket_cache(path, max_subpockets=30):
+    """Load, normalize and validate one cache for sharing across datasets."""
+    print(f"从预处理文件加载并预检子口袋特征: {path}")
+    raw_cache = _torch_load_cpu(path)
+    if not isinstance(raw_cache, dict):
+        raise TypeError(f"Expected a dict subpocket cache, got {type(raw_cache)!r}.")
+    valid_count = sum(1 for value in raw_cache.values() if value is not None)
+    prepared = prepare_subpocket_cache(raw_cache, max_subpockets=max_subpockets)
+    print(f"已加载 {len(prepared)} 个蛋白质的子口袋特征（其中 {valid_count} 个有效）")
+    return prepared
 
 class ProteinMoleculeDataset(Dataset):
     def __init__(self, sequence_data, mol_obj, prot_obj, device='cpu', 
                  use_3d=False, pdb_dir=None, prot_3d_obj=None,
                  use_subpocket=False, subpocket_dir=None, pocket_num=30, 
-                 subpocket_cache_path=None):
+                 subpocket_cache_path=None, subpocket_obj=None):
         super(ProteinMoleculeDataset, self).__init__()
 
         if isinstance(sequence_data,list):
@@ -111,27 +121,28 @@ class ProteinMoleculeDataset(Dataset):
         self.pocket_num = pocket_num
         self.subpocket_cache_loaded = False  # 标记是否从预处理文件加载
         if use_subpocket:
-            if subpocket_dir is None and subpocket_cache_path is None:
+            if subpocket_dir is None and subpocket_cache_path is None and subpocket_obj is None:
                 raise Exception("For subpocket features, provide subpocket_dir or subpocket_cache_path")
+            if subpocket_obj is not None:
+                self.prots_subpocket = prepare_subpocket_cache(
+                    subpocket_obj, max_subpockets=self.pocket_num
+                )
+                self.subpocket_cache_loaded = True
             # 优先从预处理文件加载（如果存在）
-            if subpocket_cache_path is not None and os.path.exists(subpocket_cache_path):
-                print(f"从预处理文件加载子口袋特征: {subpocket_cache_path}")
-                try:
-                    self.prots_subpocket = torch.load(
-                        subpocket_cache_path, map_location="cpu", weights_only=False
-                    )
-                except TypeError:  # PyTorch versions before weights_only existed.
-                    self.prots_subpocket = torch.load(
-                        subpocket_cache_path, map_location="cpu"
-                    )
-                valid_count = sum(1 for v in self.prots_subpocket.values() if v is not None)
-                print(f"已加载 {len(self.prots_subpocket)} 个蛋白质的子口袋特征（其中 {valid_count} 个有效）")
+            elif subpocket_cache_path is not None and os.path.exists(subpocket_cache_path):
+                self.prots_subpocket = load_prepared_subpocket_cache(
+                    subpocket_cache_path, max_subpockets=self.pocket_num
+                )
                 self.subpocket_cache_loaded = True
             else:
                 # 延迟加载：在需要时从子口袋文件创建
-                self.prots_subpocket = {}
+                self.prots_subpocket = PreparedSubpocketCache(
+                    max_subpockets=self.pocket_num
+                )
+            self._missing_subpocket = ensure_subpocket_slots(None, self.pocket_num)
         else:
             self.prots_subpocket = None
+            self._missing_subpocket = None
 
         self.device = device
 
@@ -237,11 +248,10 @@ class ProteinMoleculeDataset(Dataset):
                 # 使用蛋白质名称（prot_name）而不是序列（prot_key）来查找PDB文件
                 try:
                     subpocket_data = process_protein_subpocket(prot_name, self.pdb_dir, self.subpocket_dir, self.pocket_num)
-                    if subpocket_data is not None:
-                        self.prots_subpocket[prot_key] = subpocket_data
-                    else:
-                        # 缓存 None 值，避免重复尝试加载
-                        self.prots_subpocket[prot_key] = None
+                    subpocket_data = ensure_subpocket_slots(
+                        subpocket_data, self.pocket_num
+                    )
+                    self.prots_subpocket[prot_key] = subpocket_data
                 except Exception as e:
                     raise RuntimeError(
                         f"Failed to construct subpocket features for {prot_name}; "
@@ -255,10 +265,10 @@ class ProteinMoleculeDataset(Dataset):
 
         # 构建数据字典，确保所有可选属性都被设置
         if self.use_subpocket:
-            # Always carry M explicit slots, including cache misses.  This is
-            # required because nested PyG data otherwise drops None values and
-            # loses the correspondence to the outer DTI batch.
-            subpocket_data = ensure_subpocket_slots(subpocket_data, self.pocket_num)
+            # Cache entries were normalized and strictly validated once during
+            # dataset construction. Reuse their flat tensors for every pair.
+            if subpocket_data is None:
+                subpocket_data = self._missing_subpocket
 
         data_dict = {
             ## MOLECULE
@@ -285,8 +295,6 @@ class ProteinMoleculeDataset(Dataset):
             'protein_id': protein_id,
             'mol_key': mol_key,
             'prot_key': prot_key,
-            # BI GRAPH
-            'm2p_edge_index': get_m2p_edge(mol_x, prot_node_aa, mol['node_levels'])
         }
         
         # 总是设置可选属性，即使为 None，以确保批处理时所有对象都有相同的属性
@@ -492,8 +500,6 @@ class MultiGraphData(Data):
             return self.prot_3d_data.num_nodes
         elif key == 'subpocket_edge_index' and hasattr(self, 'subpocket_data') and not self._is_placeholder(self.subpocket_data):
             return self.subpocket_data.num_nodes
-        elif key == 'm2p_edge_index':
-            return torch.tensor([[self.mol_x.size(0)], [self.prot_node_aa.size(0)]])
         else:
             return super(MultiGraphData, self).__inc__(key, item, *args)
     

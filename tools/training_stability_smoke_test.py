@@ -46,6 +46,10 @@ def parse_args() -> argparse.Namespace:
                         help="default: cuda:0 when available, otherwise cpu")
     parser.add_argument("--cuda-stability", action="store_true",
                         help="synchronous conservative CUDA path for localization")
+    parser.add_argument("--legacy-runtime", action="store_true",
+                        help="use the pre-optimization subpocket/m2p runtime path")
+    parser.add_argument("--output", type=Path,
+                        help="optional path for the final JSON report")
     return parser.parse_args()
 
 
@@ -157,36 +161,96 @@ def main() -> int:
         persistent_workers=False,
     )
     model = MIFDTI(
-        device=device, use_subpocket=True, pocket_num=hp.pocket_num
+        device=device,
+        use_subpocket=True,
+        pocket_num=hp.pocket_num,
+        runtime_optimization=not args.legacy_runtime,
     ).to(device).train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=hp.Learning_rate)
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     started = time.monotonic()
+    stage_timing = {
+        "train_dataloader_wait": 0.0,
+        "train_h2d": 0.0,
+        "train_forward_and_loss": 0.0,
+        "train_backward_and_clip": 0.0,
+        "train_optimizer": 0.0,
+        "validation_total": 0.0,
+    }
     completed_steps = 0
     validation_steps = 0
     last_loss = None
     for epoch in range(1, args.epochs + 1):
         epoch_steps = 0
         print(f"[STRESS] epoch={epoch}/{args.epochs} DataLoader start", flush=True)
-        for batch_index, batch in enumerate(loader):
+        train_iterator = iter(loader)
+        batch_index = 0
+        while True:
             if args.max_batches_per_epoch and batch_index >= args.max_batches_per_epoch:
                 break
+            wait_started = time.perf_counter()
+            try:
+                batch = next(train_iterator)
+            except StopIteration:
+                break
+            stage_timing["train_dataloader_wait"] += time.perf_counter() - wait_started
             print(f"[STRESS] epoch={epoch} batch={batch_index} collated", flush=True)
             optimizer.zero_grad(set_to_none=True)
-            batch = batch.to(device)
-            logits = model(batch)
-            loss = F.cross_entropy(logits, batch.cls_y)
+            if device.type == "cuda":
+                h2d_start = torch.cuda.Event(enable_timing=True)
+                h2d_end = torch.cuda.Event(enable_timing=True)
+                forward_end = torch.cuda.Event(enable_timing=True)
+                backward_end = torch.cuda.Event(enable_timing=True)
+                optimizer_end = torch.cuda.Event(enable_timing=True)
+                h2d_start.record()
+                batch = batch.to(device)
+                h2d_end.record()
+                logits = model(batch)
+                loss = F.cross_entropy(logits, batch.cls_y)
+                forward_end.record()
+            else:
+                stage_started = time.perf_counter()
+                batch = batch.to(device)
+                stage_timing["train_h2d"] += time.perf_counter() - stage_started
+                stage_started = time.perf_counter()
+                logits = model(batch)
+                loss = F.cross_entropy(logits, batch.cls_y)
+                stage_timing["train_forward_and_loss"] += (
+                    time.perf_counter() - stage_started
+                )
             if not torch.isfinite(logits).all() or not torch.isfinite(loss):
                 raise FloatingPointError(
                     f"non-finite output at epoch={epoch}, batch={batch_index}"
                 )
+            if device.type != "cuda":
+                stage_started = time.perf_counter()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            if device.type == "cuda":
+                backward_end.record()
+            else:
+                stage_timing["train_backward_and_clip"] += (
+                    time.perf_counter() - stage_started
+                )
+                stage_started = time.perf_counter()
             optimizer.step()
             if device.type == "cuda":
+                optimizer_end.record()
                 torch.cuda.synchronize(device)
+                stage_timing["train_h2d"] += h2d_start.elapsed_time(h2d_end) / 1000.0
+                stage_timing["train_forward_and_loss"] += (
+                    h2d_end.elapsed_time(forward_end) / 1000.0
+                )
+                stage_timing["train_backward_and_clip"] += (
+                    forward_end.elapsed_time(backward_end) / 1000.0
+                )
+                stage_timing["train_optimizer"] += (
+                    backward_end.elapsed_time(optimizer_end) / 1000.0
+                )
+            else:
+                stage_timing["train_optimizer"] += time.perf_counter() - stage_started
             last_loss = float(loss.detach().cpu())
             completed_steps += 1
             epoch_steps += 1
@@ -196,11 +260,13 @@ def main() -> int:
                 flush=True,
             )
             del batch, logits, loss
+            batch_index += 1
         if epoch_steps == 0:
             raise RuntimeError(f"No full batch was completed in epoch {epoch}.")
         if args.validation_batches:
             model.eval()
             print(f"[STRESS] epoch={epoch} validation start", flush=True)
+            validation_started = time.perf_counter()
             with torch.no_grad():
                 for validation_index, batch in enumerate(validation_loader):
                     if validation_index >= args.validation_batches:
@@ -220,15 +286,25 @@ def main() -> int:
                         flush=True,
                     )
                     del batch, logits
+            stage_timing["validation_total"] += time.perf_counter() - validation_started
             model.train()
 
     peak_memory = (
         int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else None
     )
-    print(json.dumps({
+    elapsed_seconds = time.monotonic() - started
+    attributed_seconds = sum(stage_timing.values())
+    stage_timing["unattributed_python_and_diagnostics"] = max(
+        0.0, elapsed_seconds - attributed_seconds
+    )
+    stage_timing = {
+        key: round(value, 6) for key, value in stage_timing.items()
+    }
+    report = {
         "status": "ok",
         "dataset": args.dataset,
         "device": str(device),
+        "runtime_optimization": not args.legacy_runtime,
         "batch_size": args.batch_size,
         "epochs": args.epochs,
         "max_batches_per_epoch": args.max_batches_per_epoch,
@@ -237,8 +313,14 @@ def main() -> int:
         "last_loss": last_loss,
         "cuda_stability": args.cuda_stability,
         "peak_cuda_memory_bytes": peak_memory,
-        "elapsed_seconds": round(time.monotonic() - started, 3),
-    }, ensure_ascii=False, indent=2), flush=True)
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "stage_timing_seconds": stage_timing,
+    }
+    rendered = json.dumps(report, ensure_ascii=False, indent=2)
+    print(rendered, flush=True)
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(rendered + "\n", encoding="utf-8")
     return 0
 
 

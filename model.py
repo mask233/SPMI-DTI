@@ -10,7 +10,11 @@ import torch.nn.functional as F
 from torch.nn import Embedding
 from layers import *
 from layers_subpocket import SubpocketEncoder, PocketTransformer
-from utils.subpocket_batch import combine_subpocket_graphs, split_subpocket_batch
+from utils.subpocket_batch import (
+    combine_subpocket_graphs,
+    prepare_subpocket_runtime_batch,
+    split_subpocket_batch,
+)
 from torch_geometric.data import Batch, Data
 from torch_geometric.nn import (
                                 GATConv,
@@ -251,7 +255,8 @@ class MIFDTI(nn.Module):
     MIF-DTI主模型：多模态信息融合的药物-靶点相互作用预测模型
     融合图结构信息（分子图和蛋白质图）和序列信息（SMILES和氨基酸序列）
     """
-    def __init__(self, depth=3, device='cuda:1', use_subpocket=False, pocket_num=30):
+    def __init__(self, depth=3, device='cuda:1', use_subpocket=False, pocket_num=30,
+                 debug_data_validation=False, runtime_optimization=True):
         """
         初始化MIF-DTI模型
         
@@ -270,6 +275,8 @@ class MIFDTI(nn.Module):
         self.device = device
         self.use_subpocket = use_subpocket
         self.pocket_num = pocket_num
+        self.debug_data_validation = bool(debug_data_validation)
+        self.runtime_optimization = bool(runtime_optimization)
 
         # 药物分子特征编码器
         self.atom_type_encoder = Embedding(20, self.hidden_channels)  # 原子类型嵌入
@@ -358,15 +365,23 @@ class MIFDTI(nn.Module):
         drug_repr = []
         prot_repr = []
         for i in range(self.depth):
-            m2p_edge_index = get_m2p_edge_from_batch(atom_batch, aa_batch, node_level=atom_node_level)
+            edge_builder = (
+                get_m2p_edge_from_batch
+                if self.runtime_optimization else get_m2p_edge_from_batch_dense
+            )
+            m2p_edge_index = edge_builder(
+                atom_batch, aa_batch, node_level=atom_node_level
+            )
             out = self.blocks[i](atom_x, atom_edge_index, bond_x, atom_batch, \
                                  aa_x, aa_edge_index, aa_edge_attr, aa_batch, \
                                  m2p_edge_index)
             atom_x, aa_x, drug_global_repr, prot_global_repr = out
-            # NaN 检查：如果图编码产生 NaN，用零替代防止传播
-            if torch.isnan(drug_global_repr).any() or torch.isnan(prot_global_repr).any():
-                drug_global_repr = torch.nan_to_num(drug_global_repr, nan=0.0)
-                prot_global_repr = torch.nan_to_num(prot_global_repr, nan=0.0)
+            if self.debug_data_validation and (
+                    not torch.isfinite(drug_global_repr).all().item()
+                    or not torch.isfinite(prot_global_repr).all().item()):
+                raise FloatingPointError(
+                    f"Non-finite graph representation after MIF block {i}."
+                )
             drug_repr.append(drug_global_repr)
             prot_repr.append(prot_global_repr)
 
@@ -414,9 +429,29 @@ class MIFDTI(nn.Module):
 
 
     def _prepare_subpocket_batch(self, raw_data, device, batch_size):
+        if batch_size is None or int(batch_size) < 1:
+            raise ValueError("A positive DTI batch_size is required for subpocket preparation.")
+        if getattr(self, 'runtime_optimization', True) and (
+                isinstance(raw_data, Batch)
+                or (
+                    isinstance(raw_data, (list, tuple))
+                    and all(isinstance(item, Batch) for item in raw_data)
+                )
+        ):
+            return prepare_subpocket_runtime_batch(
+                raw_data,
+                batch_size=int(batch_size),
+                graphs_per_sample=self.pocket_num,
+                device=device,
+                feature_width=31,
+                validate_values=getattr(self, 'debug_data_validation', False),
+            )
+        return self._prepare_subpocket_batch_legacy(raw_data, device, batch_size)
+
+    def _prepare_subpocket_batch_legacy(self, raw_data, device, batch_size):
         """
         将DataLoader提供的子口袋字段整理为单个Batch，便于编码器处理
-        使用固定槽位验证和张量级合并，避开 PyG separate/collate 原生崩溃路径
+        保留优化前的逐槽位拆分/校验路径，用于严格等价性对照。
         """
         if batch_size is None or int(batch_size) < 1:
             raise ValueError("A positive DTI batch_size is required for subpocket preparation.")
@@ -501,6 +536,15 @@ class MIFDTI(nn.Module):
         node_feat = getattr(subpocket_batch, 'x', None)
         return node_feat is not None and node_feat.numel() > 0
 
+def get_m2p_edge_from_batch_dense(atom_batch, aa_batch, node_level=None):
+    """Reference implementation retained for bitwise-equivalence checks."""
+    mask = atom_batch.unsqueeze(1) == aa_batch.unsqueeze(0)
+    if node_level is not None:
+        mask = mask * (node_level == 1).reshape(-1).unsqueeze(1)
+    a_idx, b_idx = torch.nonzero(mask, as_tuple=True)
+    return torch.stack([a_idx, b_idx], dim=0)
+
+
 def get_m2p_edge_from_batch(atom_batch, aa_batch, node_level=None):
     """
     根据批次信息构建药物-蛋白质交互图的边索引
@@ -513,12 +557,39 @@ def get_m2p_edge_from_batch(atom_batch, aa_batch, node_level=None):
     Returns:
         edge_list: 边索引矩阵 [2, num_edges]
     """
-    # 创建批次匹配矩阵：同一批次内的节点可以连接
-    mask = atom_batch.unsqueeze(1) == aa_batch.unsqueeze(0)  # (num_a_nodes, num_b_nodes) 的bool矩阵
-    # 如果指定了节点层级，只连接特定层级的节点
+    if atom_batch.dim() != 1 or aa_batch.dim() != 1:
+        raise ValueError("atom_batch and aa_batch must be one-dimensional.")
+    atom_indices = torch.arange(
+        atom_batch.numel(), dtype=torch.long, device=atom_batch.device
+    )
     if node_level is not None:
-        mask = mask * (node_level==1).unsqueeze(1)
-    # 提取非零元素的位置作为边
-    a_idx, b_idx = torch.nonzero(mask, as_tuple=True)
-    edge_list = torch.stack([a_idx, b_idx], dim=0)
-    return edge_list
+        if node_level.numel() != atom_batch.numel():
+            raise ValueError("node_level must have one value per atom node.")
+        atom_indices = atom_indices[node_level.reshape(-1).eq(1)]
+    if atom_indices.numel() == 0 or aa_batch.numel() == 0:
+        return torch.empty((2, 0), dtype=torch.long, device=atom_batch.device)
+
+    # PyG batches store every sample's nodes contiguously. Build the same
+    # atom-major Cartesian products returned by nonzero(dense_mask), without
+    # allocating total_atoms x total_residues temporary storage.
+    # ``minlength`` also covers a pathological sample whose protein pooling
+    # produced no nodes; the dense reference would simply emit no edges for it.
+    aa_counts = torch.bincount(aa_batch, minlength=atom_batch.numel())
+    aa_order = torch.argsort(aa_batch, stable=True)
+    atom_group = atom_batch[atom_indices]
+    edge_counts = aa_counts[atom_group]
+    a_idx = torch.repeat_interleave(atom_indices, edge_counts)
+    if a_idx.numel() == 0:
+        return torch.empty((2, 0), dtype=torch.long, device=atom_batch.device)
+
+    aa_offsets = torch.cumsum(aa_counts, dim=0) - aa_counts
+    segment_offsets = torch.cumsum(edge_counts, dim=0) - edge_counts
+    local_aa_index = (
+        torch.arange(a_idx.numel(), dtype=torch.long, device=atom_batch.device)
+        - torch.repeat_interleave(segment_offsets, edge_counts)
+    )
+    grouped_aa_index = (
+        torch.repeat_interleave(aa_offsets[atom_group], edge_counts) + local_aa_index
+    )
+    b_idx = aa_order[grouped_aa_index]
+    return torch.stack([a_idx, b_idx], dim=0)
